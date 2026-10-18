@@ -1,0 +1,105 @@
+# cfproxy: the Cloudflare half of the project, run on a GitHub runner.
+#
+# Started by ./cfproxy.sh (deploy / destroy / check) through the GitHub API (workflow_dispatch), or by hand from the
+# Actions tab. The settings come from the repository secrets and variables that `./cfproxy.sh init` keeps equal to
+# your .env file; nothing is ever written into this file.
+#
+# The log of a run can be read by anyone who can see the repository. Therefore:
+#   * hostnames, tokens and the secret path are masked in the log before anything prints them;
+#   * the result (the Worker's address and the full log) is sealed with YOUR public key (the CFP_PUBKEY variable)
+#     before it is uploaded: only the .env file of your machine can open it. The artifact is deleted after a day.
+name: cfproxy
+run-name: cfproxy ${{ inputs.action }} ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to do
+        type: choice
+        required: true
+        default: check
+        options:
+          - deploy
+          - destroy
+          - check
+      target:
+        description: Where to put the tunnel exit
+        type: choice
+        required: true
+        default: worker
+        options:
+          - worker
+          - pages
+      request_id:
+        description: "Set by cfproxy.sh to find this run again (leave empty when started by hand)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# one run at a time: they all change the same Cloudflare project
+concurrency:
+  group: cfproxy
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  run:
+    name: ${{ inputs.action }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            lib
+            worker
+          persist-credentials: false
+
+      - name: cfproxy ${{ inputs.action }}
+        env:
+          PYTHONUNBUFFERED: "1"
+          CFP_RESULT_FILE: ${{ runner.temp }}/cfproxy/result.bin
+          # the inputs only ever reach the script through the environment, and are checked below
+          CFP_ACTION: ${{ inputs.action }}
+          CFP_TARGET: ${{ inputs.target }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
+          WS_PATH: ${{ secrets.WS_PATH }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+          WORKER_NAME: ${{ vars.WORKER_NAME }}
+          ALLOW: ${{ vars.ALLOW }}
+          CFP_PUBKEY: ${{ vars.CFP_PUBKEY }}
+        run: |
+          set -euo pipefail
+          set -f   # nothing below may be expanded by the shell
+          mkdir -p "$(dirname "$CFP_RESULT_FILE")"
+          chmod 700 "$(dirname "$CFP_RESULT_FILE")"
+
+          case "$CFP_ACTION" in
+            deploy|destroy|check) ;;
+            *) echo "unknown action" >&2; exit 2 ;;
+          esac
+          case "$CFP_TARGET" in
+            worker|pages) ;;
+            *) echo "unknown target" >&2; exit 2 ;;
+          esac
+
+          python3 lib/cfp_deploy.py
+
+      - name: Hand the sealed result to the client
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfproxy-result
+          path: ${{ runner.temp }}/cfproxy/result.bin
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
