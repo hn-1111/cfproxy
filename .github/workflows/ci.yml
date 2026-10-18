@@ -34,5 +34,9 @@ jobs:
       - name: Shell syntax
         run: bash -n cfproxy.sh
 
+      # cfproxy.sh carries the project inside itself: it must match lib/, worker/ and the workflow
+      - name: Single file is current
+        run: python3 tools/build.py --check
+
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
