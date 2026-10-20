@@ -7,7 +7,7 @@
 
 The packed part is a zip (base64, every line a shell comment) with exactly what a client machine needs:
 lib/*.py for the command line, and the files `init` sends to the GitHub repository (.github/workflows/deploy.yml,
-worker/index.js, lib/cfp_deploy.py, lib/cfp_crypto.py). The build is deterministic: the same sources give the same file.
+worker/index.js, server/index.mjs, lib/cfp_deploy.py, lib/cfp_crypto.py). The build is deterministic: the same sources give the same file.
 Standard library only.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ import zipfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT = "cfproxy.sh"
 LAUNCHER = os.path.join("tools", "launcher.sh")
-EXTRA_FILES = ("worker/index.js", ".github/workflows/deploy.yml")
+EXTRA_FILES = ("worker/index.js", "server/index.mjs", ".github/workflows/deploy.yml")
 MARK = b"#__CFPROXY" + b"_PAYLOAD__"  # the line after which the packed project starts (launcher.sh holds the same split)
 LINE = 76
 
