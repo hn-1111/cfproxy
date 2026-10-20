@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""cfproxy: Telegram MTProto / SOCKS5 proxies that exit through a Cloudflare Worker (or Pages) you deploy yourself.
+"""cfproxy: Telegram MTProto / SOCKS5 proxies that exit through a Cloudflare Worker (or Pages, or Railway) you deploy yourself.
 
   setup     ask for the tokens, make the secrets (AUTH_TOKEN, MTPROTO_SECRET, ...) and write the .env file
   init      create the GitHub repository, push the deploy files, send the settings to it
-  deploy    run the workflow: it puts the Worker (or Pages project) on Cloudflare; WORKER_HOST is saved
-  destroy   take the Worker / Pages project down again
-  check     is everything ready? (--cloudflare also checks the Cloudflare token on the runner)
+  deploy    run the workflow: it puts the Worker (or Pages project, or Railway service) online; WORKER_HOST is saved
+  destroy   take it down again
+  check     is everything ready? (--remote also checks the Cloudflare / Railway token on the runner)
   status    your settings, the last scan, and whether the deployment answers
-  scan      test Cloudflare IPs x ports from YOUR network and keep the ones that really carry a tunnel
+  scan      test Cloudflare IPs x ports (Railway: the addresses of your domain) from YOUR network, keep the ones that carry a tunnel
   serve     run the local MTProto + SOCKS5 proxies (they use the scan result)
   links     print the proxy links (tg://proxy, tg://socks, ...)
   test      prove the whole path again: clean IP -> Cloudflare -> Worker -> Telegram
@@ -148,16 +148,27 @@ def v_any(x):
     return ""
 
 
-# (env name, flag attribute, question, secret, required, validator, default)
+RAILWAY_NOTICE = ("Railway's Acceptable Use Policy lists 'operating proxies or anonymization services' as abuse: the workspace "
+                  "can be restricted or banned. Ask Railway first and use a separate account (README: Railway).")
+
+# (env name, flag attribute, question, secret, required, validator, default, group)
+# group: "" always asked | "cf" only for the Cloudflare targets (worker, pages) | "rw" only for railway
 SETUP_FIELDS = (
-    ("GITHUB_API_TOKEN", "github_token", "GitHub token (classic: scopes repo + workflow)", True, True, v_any, ""),
-    ("GITHUB_REPO", "repo", "GitHub repository to use (owner/name; it is created when missing)", False, True, v_repo, ""),
-    ("CF_API_TOKEN", "cf_token", "Cloudflare API token (Edit Cloudflare Workers; Pages: Edit too)", True, True, v_any, ""),
-    ("CF_ACCOUNT_ID", "cf_account", "Cloudflare account id (32 characters)", False, True, v_account, ""),
-    ("CFP_TARGET", "target", "Deploy as 'worker' or 'pages'", False, True, v_choice("worker", "pages"), "worker"),
+    ("GITHUB_API_TOKEN", "github_token", "GitHub token (classic: scopes repo + workflow)", True, True, v_any, "", ""),
+    ("GITHUB_REPO", "repo", "GitHub repository to use (owner/name; it is created when missing)", False, True, v_repo, "", ""),
+    ("CFP_TARGET", "target", "Deploy as 'worker' or 'pages' (Cloudflare), or 'railway'", False, True,
+     v_choice("worker", "pages", "railway"), "worker", ""),
+    ("CF_API_TOKEN", "cf_token", "Cloudflare API token (Edit Cloudflare Workers; Pages: Edit too)", True, True, v_any, "", "cf"),
+    ("CF_ACCOUNT_ID", "cf_account", "Cloudflare account id (32 characters)", False, True, v_account, "", "cf"),
+    ("RAILWAY_API_TOKEN", "railway_token", "Railway API token (railway.com/account/tokens, workspace: No workspace)", True, True,
+     v_any, "", "rw"),
+    ("RAILWAY_WORKSPACE_ID", "railway_workspace", "Railway workspace id (only for a workspace token; else Enter)", False, False,
+     v_any, "", "rw"),
+    ("RAILWAY_REGION", "railway_region", "Railway region (optional, e.g. europe-west4-drams3a; Enter = Railway's default)", False,
+     False, v_any, "", "rw"),
     ("ALLOW", "allow", "Exit allowed to: 'all' (SOCKS5 + MTProto) or 'telegram' (MTProto only)", False, True,
-     v_choice("all", "telegram"), "all"),
-    ("CUSTOM_DOMAIN", "domain", "Your own domain on Cloudflare for the Worker", False, False, v_domain, ""),
+     v_choice("all", "telegram"), "all", ""),
+    ("CUSTOM_DOMAIN", "domain", "Your own domain on Cloudflare for the Worker", False, False, v_domain, "", "cf"),
 )
 
 
@@ -166,7 +177,10 @@ def cmd_setup(args) -> int:
     interactive = sys.stdin.isatty() and not args.non_interactive
     if interactive:
         say(bold("cfproxy setup") + dim(f"   (saved in {path}; Enter keeps what is already there)"))
-    for name, attr, question, secret, required, validate, default in SETUP_FIELDS:
+    target = getattr(args, "target", None) or env("CFP_TARGET") or "worker"
+    for name, attr, question, secret, required, validate, default, group in SETUP_FIELDS:
+        if (group == "cf" and target == "railway") or (group == "rw" and target != "railway"):
+            continue
         current = env(name)
         value = getattr(args, attr, None)
         if value is None:
@@ -188,6 +202,10 @@ def cmd_setup(args) -> int:
             raise ConfigError(f"{name}: {problem}")
         if value != current:
             env_set(path, name, value)
+        if name == "CFP_TARGET":
+            target = value
+            if target == "railway":
+                warn(RAILWAY_NOTICE)
     made = generate_missing()
     if made:
         ok("made and saved: " + ", ".join(made))
@@ -252,6 +270,8 @@ def run_action(action: str, target: str, args) -> int:
 
 def cmd_deploy(args) -> int:
     target = args.target or env("CFP_TARGET", "worker")
+    if target == "railway":
+        warn(RAILWAY_NOTICE)
     code = run_action("deploy", target, args)
     if code == 0:
         say("Next: ./cfproxy.sh scan     then: ./cfproxy.sh serve")
@@ -263,7 +283,9 @@ def cmd_destroy(args) -> int:
     if not args.yes:
         if not sys.stdin.isatty():
             raise ConfigError("destroy asks for a confirmation: run it in a terminal or add --yes")
-        if ask(f"Delete the {target} '{env('WORKER_NAME', 'cfproxy')}' from Cloudflare? Type yes", "", required=False) != "yes":
+        what = (f"Delete the Railway service of project '{env('WORKER_NAME', 'cfproxy')}'?" if target == "railway"
+                else f"Delete the {target} '{env('WORKER_NAME', 'cfproxy')}' from Cloudflare?")
+        if ask(f"{what} Type yes", "", required=False) != "yes":
             warn("nothing deleted")
             return 1
     return run_action("destroy", target, args)
@@ -278,7 +300,7 @@ def cmd_check(args) -> int:
             apply_result(payload, False)
         bad += 0 if good and payload.get("ok") else 1
     elif not bad:
-        say("Add --cloudflare to also check the Cloudflare token (it runs on the GitHub runner).")
+        say("Add --remote to also check the Cloudflare / Railway token (it runs on the GitHub runner).")
     return 1 if bad else 0
 
 
@@ -307,14 +329,24 @@ def cmd_runs(args) -> int:
 
 # ---------------------------------------------------------------- scan
 
+def resolve_ipv4(host: str) -> list:
+    """The IPv4 addresses of `host` as this machine's DNS gives them (Railway: the addresses of your *.up.railway.app domain)."""
+    try:
+        found = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as e:
+        raise ConfigError(f"cannot resolve {host}: {e} (is DNS blocked here? write its address into a file and use --ips FILE)")
+    return sorted({f[4][0] for f in found})
+
+
 def cmd_scan(args) -> int:
-    if args.update_ranges:
+    railway = env("CFP_TARGET") == "railway"
+    if args.update_ranges and not railway:
         try:
             ok(f"{scan_mod.update_ranges()} Cloudflare IPv4 ranges saved in {scan_mod.ranges_path()}")
         except Exception as e:  # noqa: BLE001 (offline: the built-in list still works)
             warn(f"could not download the ranges ({e}): using the built-in list")
     st = settings("host", "auth_token")
-    ports = parse_ports(args.ports)
+    ports = parse_ports("443" if railway and args.ports == "all" else args.ports)
     if args.ips:
         try:
             with open(args.ips, encoding="utf-8") as f:
@@ -323,6 +355,9 @@ def cmd_scan(args) -> int:
             raise ConfigError(f"cannot read {args.ips}: {e.strerror}")
         if not source:
             raise ConfigError(f"{args.ips} holds no IP address or range")
+    elif railway:
+        source = resolve_ipv4(st.host)
+        info(f"{st.host} resolves to {', '.join(source)}")
     else:
         source = scan_mod.load_ranges()
     ips = scan_mod.sample_ips(source, args.count)
@@ -467,16 +502,16 @@ async def serve_async(args, st: Settings, endpoints: list, path: str) -> None:
     except OSError as e:
         raise ConfigError(f"cannot listen on {args.listen}: {e.strerror} (is another cfproxy running? use --socks-port / --mtproto-port)")
     host = link_host(args, args.listen)
-    info(f"cfproxy is running: {len(eps)} endpoint(s), best {eps[0]} ; Ctrl+C stops it")
-    print_links(build_links(st, host, socks_pool is not None, mtproto_pool is not None,
-                            bridge.socks_port, bridge.mtproto_port))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGINT, signal.SIGTERM):  # before the links appear: whoever reads them may stop it at once
         try:
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):  # Windows: Ctrl+C arrives as KeyboardInterrupt
             pass
+    info(f"cfproxy is running: {len(eps)} endpoint(s), best {eps[0]} ; Ctrl+C stops it")
+    print_links(build_links(st, host, socks_pool is not None, mtproto_pool is not None,
+                            bridge.socks_port, bridge.mtproto_port))
     watchers = [asyncio.ensure_future(watch_endpoints(
         path, [(p, t) for p, t in ((socks_pool, True), (mtproto_pool, False)) if p is not None],
         args.allow_plain_socks, stop))]
@@ -589,7 +624,8 @@ def cmd_status(args) -> int:
             ("mtproto secret", "set" if st.mtproto_secret else "-"), ("aes backend", mt.BACKEND),
             ("socks login", "set" if st.socks_user else "none"),
             ("github", f"{env('GITHUB_REPO', '-')} (token {'set' if gh_mod.github_token() else '-'})"),
-            ("cloudflare token", "set" if env("CF_API_TOKEN") else "-"))
+            (("railway token", "set" if env("RAILWAY_API_TOKEN") else "-") if env("CFP_TARGET") == "railway"
+             else ("cloudflare token", "set" if env("CF_API_TOKEN") else "-")))
     for label, value in rows:
         say(f"  {label:<17} {value}")
     try:
@@ -626,13 +662,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--non-interactive", action="store_true", help="never ask: use flags and the existing .env")
     for flag, dest in (("--github-token", "github_token"), ("--repo", "repo"), ("--cf-token", "cf_token"),
                        ("--cf-account", "cf_account"), ("--target", "target"), ("--allow", "allow"),
-                       ("--domain", "domain")):
+                       ("--domain", "domain"), ("--railway-token", "railway_token"),
+                       ("--railway-workspace", "railway_workspace"), ("--railway-region", "railway_region")):
         s.add_argument(flag, dest=dest, default=None)
 
     s = sub.add_parser("init", help="create the GitHub repository, push the deploy files, send the settings")
     s.add_argument("--public", action="store_true", help="create a public repository (default: private)")
 
-    for name, text in (("deploy", "put the Worker / Pages project on Cloudflare"), ("destroy", "delete it again")):
+    for name, text in (("deploy", "put the Worker / Pages project / Railway service online"), ("destroy", "delete it again")):
         s = sub.add_parser(name, help=text)
         s.add_argument("--target", choices=gh_mod.TARGETS, default=None)
         s.add_argument("--timeout", type=int, default=1800, help="seconds to wait for the workflow")
@@ -641,7 +678,8 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--yes", action="store_true", help="do not ask for a confirmation")
 
     s = sub.add_parser("check", help="is everything ready for deploy?")
-    s.add_argument("--cloudflare", action="store_true", help="also check the Cloudflare token (runs the workflow)")
+    s.add_argument("--remote", "--cloudflare", dest="cloudflare", action="store_true",
+                   help="also check the Cloudflare / Railway token (runs the workflow)")
     s.add_argument("-v", "--verbose", action="store_true")
 
     s = sub.add_parser("fetch", help="bring back the result of an earlier workflow run")
@@ -650,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("runs", help="the latest workflow runs")
 
     s = sub.add_parser("scan", help="test Cloudflare IPs x ports and keep the ones that work")
-    s.add_argument("--ports", default="all", help="all | tls | plain | 443,8443,... (default: all 13 Cloudflare ports)")
+    s.add_argument("--ports", default="all", help="all | tls | plain | 443,8443,... (default: all 13 Cloudflare ports; Railway: 443)")
     s.add_argument("--count", type=int, default=scan_mod.DEFAULT_COUNT, help="random IPs to try")
     s.add_argument("--ips", metavar="FILE", help="test the IPs / ranges in this file instead of random ones")
     s.add_argument("--verify", type=int, default=scan_mod.DEFAULT_VERIFY, help="candidates that get the tunnel test")

@@ -33,16 +33,23 @@ ARTIFACT = "cfproxy-result"
 RESULT_NAME = "result.bin"
 RESULT_VERSION = 1
 ACTIONS = ("deploy", "destroy", "check")
-TARGETS = ("worker", "pages")
+TARGETS = ("worker", "pages", "railway")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
 
 # The only files the runner needs (relative to the project folder). `init` pushes exactly these.
-DEPLOY_FILES = (".github/workflows/deploy.yml", "worker/index.js", "lib/cfp_deploy.py", "lib/cfp_crypto.py")
+DEPLOY_FILES = (".github/workflows/deploy.yml", "worker/index.js", "server/index.mjs", "lib/cfp_deploy.py",
+                "lib/cfp_crypto.py")
 
 # What `sync` keeps equal to the .env file. The workflow reads exactly these names (tests/test_workflow.py checks it).
-SECRET_NAMES = ("CF_API_TOKEN", "CF_ACCOUNT_ID", "AUTH_TOKEN", "WS_PATH", "CUSTOM_DOMAIN")
-VAR_NAMES = ("WORKER_NAME", "ALLOW", "CFP_PUBKEY")
-REQUIRED_SECRETS = ("CF_API_TOKEN", "CF_ACCOUNT_ID", "AUTH_TOKEN", "WS_PATH")
+SECRET_NAMES = ("CF_API_TOKEN", "CF_ACCOUNT_ID", "AUTH_TOKEN", "WS_PATH", "CUSTOM_DOMAIN", "RAILWAY_API_TOKEN")
+VAR_NAMES = ("WORKER_NAME", "ALLOW", "CFP_PUBKEY", "RAILWAY_WORKSPACE_ID", "RAILWAY_REGION")
+REQUIRED_SECRETS = ("CF_API_TOKEN", "CF_ACCOUNT_ID", "AUTH_TOKEN", "WS_PATH")  # Cloudflare targets
+REQUIRED_SECRETS_RAILWAY = ("RAILWAY_API_TOKEN", "AUTH_TOKEN", "WS_PATH")
+
+
+def required_secrets(target: str | None = None) -> tuple:
+    """The secrets a deploy needs: the Cloudflare ones, or the Railway ones when the target is railway."""
+    return REQUIRED_SECRETS_RAILWAY if (target or env("CFP_TARGET", "worker")) == "railway" else REQUIRED_SECRETS
 
 
 class GitError(Exception):
@@ -380,7 +387,7 @@ def desired_settings() -> tuple:
     for name, value in {**secrets, **variables}.items():
         if "\n" in value or "\r" in value:
             raise GitError(f"{name} contains a line break: fix it in the .env file")
-    missing = [n for n in REQUIRED_SECRETS if n not in secrets]
+    missing = [n for n in required_secrets() if n not in secrets]
     if missing:
         raise GitError(f"missing in the .env file: {', '.join(missing)} (run './cfproxy.sh setup')")
     return secrets, variables
@@ -437,7 +444,7 @@ def check(gh: GitHub) -> int:
     else:
         ok(f".github/workflows/{WORKFLOW} found on {ref}")
     names, variables = gh.secret_names(), gh.variables()
-    absent = [n for n in REQUIRED_SECRETS if n not in names]
+    absent = [n for n in required_secrets() if n not in names]
     if absent or "CFP_PUBKEY" not in variables:
         bad += 1
         err("the repository settings are not up to date" + (f" (missing secrets: {', '.join(absent)})" if absent else "")
