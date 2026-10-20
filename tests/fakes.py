@@ -15,7 +15,11 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
+import shlex
+import shutil
+import socket
 import stat
 import subprocess
 import tempfile
@@ -516,3 +520,276 @@ def start_github(world):
     world.port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f"http://127.0.0.1:{world.port}"
+
+
+# ---------------------------------------------------------------- Railway
+REMAP_SHIM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "railway_remap.mjs")
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class GqlError(Exception):
+    pass
+
+
+class FakeRailway:
+    """Railway's GraphQL API, as much of it as cfp_deploy.py uses. serviceInstanceDeploy really starts the service the way
+    Railway does: the start command is split in exec form, the service variables are its environment, and the tunnel app that
+    the deploy script shipped listens on a local port (the one CFP_VERIFY_URL points at in the tests)."""
+
+    def __init__(self, token="rw-test-token", remap="", app_port=None, extra_env=None):
+        self.token = token
+        self.remap = remap                    # "149.154.167.51:443=127.0.0.1:9000": where the app's tunnels really go
+        self.extra_env = extra_env or {}      # more environment for the app, e.g. CFP_ALLOW_PRIVATE=1 (a local echo target)
+        self.app_port = app_port or free_port()
+        self.workspace_token = False          # a workspace token has no `me`
+        self.require_workspace = False        # projectCreate refuses to guess the workspace
+        self.workspace_id = "ws-test"
+        self.deploy_status = None             # force the status of new deployments, e.g. "FAILED"
+        self.flaky = 0                        # answer the next N requests with HTTP 503
+        self.projects = {}                    # id -> {"id", "name", "environments", "services": {id: service}}
+        self.calls = []                       # (root field, variables)
+        self.n = 0
+        self.workdir = tempfile.mkdtemp(prefix="fake-railway-")
+        self.server = None
+
+    # ------------------------------------------------------------ the world
+    def nid(self, kind):
+        self.n += 1
+        return f"{kind}-{self.n}"
+
+    def count(self, field):
+        return sum(1 for f, _ in self.calls if f == field)
+
+    def service(self, service_id):
+        for p in self.projects.values():
+            if service_id in p["services"]:
+                return p["services"][service_id]
+        raise GqlError("Service not found")
+
+    def project_json(self, p):
+        return {"id": p["id"], "name": p["name"],
+                "environments": {"edges": [{"node": e} for e in p["environments"]]},
+                "services": {"edges": [{"node": {"id": s["id"], "name": s["name"]}} for s in p["services"].values()]}}
+
+    def deployment(self, service, status="INITIALIZING", forced=None):
+        n = self.n = self.n + 1
+        dep = {"id": f"dep-{n}", "createdAt": f"2026-10-20T00:{n // 60:02d}:{n % 60:02d}.000Z", "status": status,
+               "forced": forced, "proc": None, "log": [], "listening": False, "polls": 0, "removed": False}
+        service["deployments"].append(dep)
+        return dep
+
+    def stop_deployment(self, dep):
+        dep["removed"] = True
+        if dep["proc"] and dep["proc"].poll() is None:
+            dep["proc"].terminate()
+            try:
+                dep["proc"].wait(5)
+            except subprocess.TimeoutExpired:
+                dep["proc"].kill()
+                dep["proc"].wait(5)
+        if dep["proc"] and dep["proc"].stdout and not dep["proc"].stdout.closed:
+            try:
+                dep["proc"].stdout.close()
+            except (OSError, ValueError):
+                pass
+
+    def run_app(self, service, dep):
+        for old in service["deployments"]:
+            if old is not dep:
+                self.stop_deployment(old)
+        command = service.get("startCommand") or ""
+        if not command:  # the image's own command: `node` without a terminal exits at once
+            dep["status"] = "CRASHED"
+            dep["log"].append("node: no script to run")
+            return
+        path = os.path.join(self.workdir, f"{dep['id']}.mjs")
+        argv = [a.replace("/tmp/cfp.mjs", path) for a in shlex.split(command)]  # exec form, like Railway
+        env = {"PATH": os.environ["PATH"], "HOME": self.workdir, **service["variables"], "PORT": str(self.app_port), "HOST": "127.0.0.1",
+               **self.extra_env}
+        if self.remap:
+            env.update({"CFP_TEST_REMAP": self.remap, "NODE_OPTIONS": f"--import {REMAP_SHIM}"})
+        proc = subprocess.Popen(argv, env=env, cwd=self.workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        dep["proc"] = proc
+
+        def pump():
+            try:
+                for line in proc.stdout:
+                    dep["log"].append(line.rstrip("\n"))
+                    if "listening on" in line:
+                        dep["listening"] = True
+            except ValueError:  # the pipe was closed by stop_deployment
+                pass
+
+        threading.Thread(target=pump, daemon=True).start()
+
+    def status(self, dep):
+        dep["polls"] += 1
+        if dep["removed"]:
+            return "REMOVED"
+        if dep["forced"]:
+            return dep["forced"]
+        if dep["proc"] is None:
+            return dep["status"]
+        if dep["listening"]:
+            return "SUCCESS"
+        if dep["proc"].poll() is not None:
+            return "CRASHED"
+        return "INITIALIZING" if dep["polls"] == 1 else "DEPLOYING"
+
+    # ------------------------------------------------------------ the operations (root fields of the GraphQL documents)
+    def op_me(self, v):
+        if self.workspace_token:
+            raise GqlError("Not Authorized")
+        return {"name": "Test User", "email": "test@example.com"}
+
+    def op_projects(self, v):
+        return {"edges": [{"node": self.project_json(p)} for p in self.projects.values()]}
+
+    def op_workspace(self, v):
+        if v.get("w") != self.workspace_id:
+            raise GqlError("Workspace not found")
+        return {"projects": self.op_projects(v)}
+
+    def op_project(self, v):
+        p = self.projects.get(v["id"])
+        return self.project_json(p) if p else None
+
+    def op_projectCreate(self, v):
+        inp = v["input"]
+        if self.require_workspace and not inp.get("workspaceId"):
+            raise GqlError("workspaceId is required")
+        if inp.get("workspaceId") not in (None, self.workspace_id):
+            raise GqlError("Workspace not found")
+        pid = self.nid("proj")
+        self.projects[pid] = {"id": pid, "name": inp["name"], "workspaceId": inp.get("workspaceId"), "services": {},
+                              "environments": [{"id": self.nid("env"), "name": "production"}]}
+        return {"id": pid}
+
+    def op_serviceCreate(self, v):
+        inp = v["input"]
+        project = self.projects.get(inp["projectId"])
+        if project is None:
+            raise GqlError("Project not found")
+        if not (inp.get("source") or {}).get("image"):
+            raise GqlError("this fake only creates services from an image")
+        sid = self.nid("svc")
+        service = {"id": sid, "name": inp["name"], "image": inp["source"]["image"], "variables": {k: str(x) for k, x in (inp.get("variables") or {}).items()},
+                   "startCommand": "", "region": "", "domains": [], "targetPort": None, "deployments": []}
+        project["services"][sid] = service
+        self.deployment(service, status="CRASHED")  # the first deployment runs the image's own command
+        return {"id": sid}
+
+    def op_variableCollectionUpsert(self, v):
+        inp = v["input"]
+        self.service(inp["serviceId"])["variables"].update({k: str(x) for k, x in inp["variables"].items()})
+        return True
+
+    def op_serviceInstanceUpdate(self, v):
+        service = self.service(v["s"])
+        for key in ("startCommand", "region", "sleepApplication"):
+            if key in v["input"]:
+                service[key] = v["input"][key]
+        return True
+
+    def op_domains(self, v):
+        return {"serviceDomains": [{"domain": d} for d in self.service(v["s"])["domains"]], "customDomains": []}
+
+    def op_serviceDomainCreate(self, v):
+        inp = v["input"]
+        service = self.service(inp["serviceId"])
+        if service["domains"]:
+            raise GqlError("Service already has a domain")
+        service["domains"].append(f"{service['name']}-production-{random.randint(1000, 9999)}.up.railway.app")
+        service["targetPort"] = inp.get("targetPort")
+        return {"domain": service["domains"][0]}
+
+    def op_serviceInstanceDeploy(self, v):
+        service = self.service(v["s"])
+        dep = self.deployment(service, forced=self.deploy_status)
+        if not self.deploy_status:
+            self.run_app(service, dep)
+        return True
+
+    def op_deployments(self, v):
+        service = self.service(v["input"]["serviceId"])
+        deps = sorted(service["deployments"], key=lambda d: d["createdAt"], reverse=True)
+        return {"edges": [{"node": {"id": d["id"], "status": self.status(d), "createdAt": d["createdAt"]}} for d in deps]}
+
+    def op_deploymentLogs(self, v):
+        for p in self.projects.values():
+            for s in p["services"].values():
+                for d in s["deployments"]:
+                    if d["id"] == v["d"]:
+                        return [{"message": line} for line in d["log"][-int(v.get("n") or 40):]]
+        raise GqlError("Deployment not found")
+
+    def op_serviceDelete(self, v):
+        service = self.service(v["id"])
+        for d in service["deployments"]:
+            self.stop_deployment(d)
+        for p in self.projects.values():
+            p["services"].pop(v["id"], None)
+        return True
+
+    def op_projectDelete(self, v):
+        project = self.projects.pop(v["id"], None)
+        if project is None:
+            raise GqlError("Project not found")
+        for s in project["services"].values():
+            for d in s["deployments"]:
+                self.stop_deployment(d)
+        return True
+
+    # ------------------------------------------------------------ the HTTP side
+    def start(self):
+        world = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, status, payload):
+                body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                if world.flaky > 0:
+                    world.flaky -= 1
+                    return self.reply(503, b"upstream unavailable")
+                if self.headers.get("Authorization") != f"Bearer {world.token}":
+                    return self.reply(200, {"errors": [{"message": "Not Authorized"}]})
+                variables = body.get("variables") or {}
+                field = re.search(r"\{\s*(\w+)", body.get("query", "")).group(1)
+                world.calls.append((field, variables))
+                try:
+                    operation = getattr(world, "op_" + field, None)
+                    if operation is None:
+                        raise GqlError(f'Cannot query field "{field}" on type "Query".')
+                    return self.reply(200, {"data": {field: operation(variables)}})
+                except GqlError as e:
+                    return self.reply(200, {"errors": [{"message": str(e)}], "data": None})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        return self
+
+    def stop(self):
+        for p in self.projects.values():
+            for s in p["services"].values():
+                for d in s["deployments"]:
+                    self.stop_deployment(d)
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+        shutil.rmtree(self.workdir, True)

@@ -161,7 +161,7 @@ class Chain(unittest.TestCase):
         before = dict(self.world.files)
         code, _, err = self.cli("init")
         self.assertEqual(code, 0, err)
-        self.assertIn("0 written, 4 already current", err)
+        self.assertIn(f"0 written, {len(gh.DEPLOY_FILES)} already current", err)
         self.assertEqual(self.world.files, before)
 
     def test_init_in_a_public_repository_if_asked(self):

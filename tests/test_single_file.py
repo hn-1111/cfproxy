@@ -348,7 +348,7 @@ class ControlsGitHub(unittest.TestCase):
         # init again: nothing to write
         r = self.cli("init")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("0 written, 4 already current", r.stderr)
+        self.assertIn(f"0 written, {len(gh.DEPLOY_FILES)} already current", r.stderr)
 
         # deploy: the workflow the client pushed runs on the (fake) runner and the Worker address comes back
         r = self.cli("deploy")

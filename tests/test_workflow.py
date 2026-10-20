@@ -80,19 +80,19 @@ class DeployWorkflow(unittest.TestCase):
         self.assertIn("lib/cfp_deploy.py", self.run_step["run"])
         self.assertTrue(os.path.exists(os.path.join(ROOT, "lib", "cfp_deploy.py")))
         checkout = next(s for s in self.steps if str(s.get("uses", "")).startswith("actions/checkout"))
-        self.assertEqual(checkout["with"]["sparse-checkout"].split(), ["lib", "worker"])
+        self.assertEqual(checkout["with"]["sparse-checkout"].split(), ["lib", "worker", "server"])
 
     def test_every_setting_the_deploy_script_reads_reaches_it(self):
         with open(os.path.join(ROOT, "lib", "cfp_deploy.py"), encoding="utf-8") as f:
             source = f.read()
         wanted = set(re.findall(r'env\("([A-Z_]+)"', source))
-        test_only = {"CF_API_BASE", "CFP_VERIFY_URL"}  # tests point these at local servers
+        test_only = {"CF_API_BASE", "RAILWAY_API_BASE", "RAILWAY_IMAGE", "CFP_VERIFY_URL", "CFP_POLL_SECONDS", "CFP_RETRY_SECONDS"}  # tests point these at local servers / a pinned image
         provided = set(self.run_step["env"])
         self.assertEqual(wanted - test_only - provided, set())
 
     def test_the_files_the_client_pushes_are_all_the_runner_needs(self):
         self.assertEqual(set(gh.DEPLOY_FILES), {
-            ".github/workflows/deploy.yml", "worker/index.js", "lib/cfp_deploy.py", "lib/cfp_crypto.py"})
+            ".github/workflows/deploy.yml", "worker/index.js", "server/index.mjs", "lib/cfp_deploy.py", "lib/cfp_crypto.py"})
         for rel in gh.DEPLOY_FILES:
             self.assertTrue(os.path.exists(os.path.join(ROOT, *rel.split("/"))), rel)
         with open(os.path.join(ROOT, "lib", "cfp_deploy.py"), encoding="utf-8") as f:
