@@ -1,4 +1,4 @@
-# cfproxy: the Cloudflare half of the project, run on a GitHub runner.
+# cfproxy: the remote half of the project (the tunnel exit on Cloudflare or on Railway), run on a GitHub runner.
 #
 # Started by ./cfproxy.sh (deploy / destroy / check) through the GitHub API (workflow_dispatch), or by hand from the
 # Actions tab. The settings come from the repository secrets and variables that `./cfproxy.sh init` keeps equal to
@@ -31,6 +31,7 @@ on:
         options:
           - worker
           - pages
+          - railway
       request_id:
         description: "Set by cfproxy.sh to find this run again (leave empty when started by hand)"
         type: string
@@ -40,7 +41,7 @@ on:
 permissions:
   contents: read
 
-# one run at a time: they all change the same Cloudflare project
+# one run at a time: they all change the same Cloudflare / Railway project
 concurrency:
   group: cfproxy
   cancel-in-progress: false
@@ -60,6 +61,7 @@ jobs:
           sparse-checkout: |
             lib
             worker
+            server
           persist-credentials: false
 
       - name: cfproxy ${{ inputs.action }}
@@ -71,10 +73,13 @@ jobs:
           CFP_TARGET: ${{ inputs.target }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
           AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
           WS_PATH: ${{ secrets.WS_PATH }}
           CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
           WORKER_NAME: ${{ vars.WORKER_NAME }}
+          RAILWAY_WORKSPACE_ID: ${{ vars.RAILWAY_WORKSPACE_ID }}
+          RAILWAY_REGION: ${{ vars.RAILWAY_REGION }}
           ALLOW: ${{ vars.ALLOW }}
           CFP_PUBKEY: ${{ vars.CFP_PUBKEY }}
         run: |
@@ -88,7 +93,7 @@ jobs:
             *) echo "unknown action" >&2; exit 2 ;;
           esac
           case "$CFP_TARGET" in
-            worker|pages) ;;
+            worker|pages|railway) ;;
             *) echo "unknown target" >&2; exit 2 ;;
           esac
 
