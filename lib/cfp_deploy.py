@@ -407,6 +407,7 @@ class RailwayApi:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._workspace: str | None = None  # decided once per run, see workspace_id()
 
     def call(self, query: str, variables: dict | None = None) -> dict:
         """The `data` of the answer. Raises DeployError carrying Railway's own message."""
@@ -455,15 +456,78 @@ class RailwayApi:
         self.call("query { projects { edges { node { id } } } }")
         return "workspace token"
 
+    def workspaces(self) -> list:
+        """[{"id", "name"}] of the workspaces an account token can use. Empty for a workspace token (it has no `me`) and when
+        Railway does not say. Railway has called them workspaces and (before) teams: both shapes are tried."""
+        for query, field in (("query { me { workspaces { id name } } }", "workspaces"),
+                             ("query { me { teams { edges { node { id name } } } } }", "teams")):
+            try:
+                me = self.call(query).get("me") or {}
+            except DeployError:
+                continue
+            value = me.get(field)
+            items = nodes(value) if isinstance(value, dict) else (value if isinstance(value, list) else [])
+            found = [{"id": str(w["id"]), "name": str(w.get("name") or "")} for w in items if isinstance(w, dict) and w.get("id")]
+            if found:
+                return found
+        return []
+
+    def knows_workspace(self, workspace_id: str) -> bool:
+        try:
+            return bool(self.call("query($w: String!) { workspace(workspaceId: $w) { id } }", {"w": workspace_id}).get("workspace"))
+        except DeployError:
+            return False
+
+    def projects_in(self, workspace_id: str) -> list:
+        data = self.call("query($w: String!) { workspace(workspaceId: $w) { projects { edges { node { "
+                         + PROJECT_FIELDS + " } } } } }", {"w": workspace_id})
+        return [plain_project(n) for n in nodes((data.get("workspace") or {}).get("projects"))]
+
+    def workspace_id(self) -> str:
+        """The workspace the project lives in ('' = let Railway decide, which is what a workspace token needs). Nobody is
+        asked: RAILWAY_WORKSPACE_ID is only a hint, and one that Railway does not know is ignored (with a warning)."""
+        if self._workspace is None:
+            self._workspace = self.pick_workspace()
+        return self._workspace
+
+    def pick_workspace(self) -> str:
+        wanted = self.cfg.railway_workspace
+        known = self.workspaces()
+        if wanted:
+            hit = next((w for w in known if w["id"] == wanted), None) or next((w for w in known if w["name"].lower() == wanted.lower()), None)
+            if hit:
+                return hit["id"]
+            if self.knows_workspace(wanted):  # not in the list (a workspace token has none): Railway is asked about this one
+                return wanted
+            warn(f"Railway does not know the workspace '{wanted}': ignoring RAILWAY_WORKSPACE_ID and finding one by itself")
+        if not known:
+            return ""
+        if len(known) > 1:
+            for w in known:  # the project of an earlier run decides, so that deploy, check and destroy all look in the same place
+                try:
+                    holds = any(p["name"] == self.cfg.name for p in self.projects_in(w["id"]))
+                except DeployError:
+                    continue
+                if holds:
+                    info(f"using the Railway workspace '{w['name'] or w['id']}' (it already holds the project '{self.cfg.name}')")
+                    return w["id"]
+        chosen = known[0]
+        text = f"using the Railway workspace '{chosen['name'] or chosen['id']}'"
+        if len(known) > 1:
+            more = ", ".join(f"'{w['name'] or w['id']}' = {w['id']}" for w in known[1:])
+            text += f" (the account has more: {more}; to use another one set RAILWAY_WORKSPACE_ID)"
+        info(text)
+        return chosen["id"]
+
     def projects(self) -> list:
-        if self.cfg.railway_workspace:
-            data = self.call("query($w: String!) { workspace(workspaceId: $w) { projects { edges { node { "
-                             + PROJECT_FIELDS + " } } } } }", {"w": self.cfg.railway_workspace})
-            connection = (data.get("workspace") or {}).get("projects")
-        else:
-            data = self.call("query { projects { edges { node { " + PROJECT_FIELDS + " } } } }")
-            connection = data.get("projects")
-        return [plain_project(n) for n in nodes(connection)]
+        workspace = self.workspace_id()
+        if workspace:
+            try:
+                return self.projects_in(workspace)
+            except DeployError as e:
+                warn(f"cannot list the projects of the Railway workspace ({e}): trying the account's own list instead")
+        data = self.call("query { projects { edges { node { " + PROJECT_FIELDS + " } } } }")
+        return [plain_project(n) for n in nodes(data.get("projects"))]
 
     def project(self, project_id: str) -> dict:
         data = self.call("query($id: String!) { project(id: $id) { " + PROJECT_FIELDS + " } }", {"id": project_id})
@@ -473,8 +537,9 @@ class RailwayApi:
 
     def create_project(self, name: str) -> dict:
         payload = {"name": name}
-        if self.cfg.railway_workspace:
-            payload["workspaceId"] = self.cfg.railway_workspace
+        workspace = self.workspace_id()
+        if workspace:
+            payload["workspaceId"] = workspace
         data = self.call("mutation($input: ProjectCreateInput!) { projectCreate(input: $input) { id } }", {"input": payload})
         return self.project(data["projectCreate"]["id"])
 
@@ -559,8 +624,9 @@ def deploy_railway(cfg: Config, api: RailwayApi) -> str:
         try:
             project = api.create_project(cfg.name)
         except DeployError as e:
-            if "workspace" in str(e).lower() and not cfg.railway_workspace:
-                raise DeployError(f"{e} (set RAILWAY_WORKSPACE_ID: run './cfproxy.sh setup' again and give the workspace id)")
+            if "workspace" in str(e).lower() and not api.workspace_id():
+                raise DeployError(f"{e} (no Railway workspace could be found by itself: set RAILWAY_WORKSPACE_ID, "
+                                  "i.e. run './cfproxy.sh setup --railway-workspace <id>')")
             raise
     environment = next((e for e in project["environments"] if e.get("name") == "production"), None) \
         or (project["environments"][0] if project["environments"] else None)

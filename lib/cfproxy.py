@@ -153,6 +153,7 @@ RAILWAY_NOTICE = ("Railway's Acceptable Use Policy lists 'operating proxies or a
 
 # (env name, flag attribute, question, secret, required, validator, default, group)
 # group: "" always asked | "cf" only for the Cloudflare targets (worker, pages) | "rw" only for railway
+#        | "rwx" railway, but never asked: the deploy finds it by itself; only the flag sets it (--railway-workspace ID, "" clears)
 SETUP_FIELDS = (
     ("GITHUB_API_TOKEN", "github_token", "GitHub token (classic: scopes repo + workflow)", True, True, v_any, "", ""),
     ("GITHUB_REPO", "repo", "GitHub repository to use (owner/name; it is created when missing)", False, True, v_repo, "", ""),
@@ -162,8 +163,8 @@ SETUP_FIELDS = (
     ("CF_ACCOUNT_ID", "cf_account", "Cloudflare account id (32 characters)", False, True, v_account, "", "cf"),
     ("RAILWAY_API_TOKEN", "railway_token", "Railway API token (railway.com/account/tokens, workspace: No workspace)", True, True,
      v_any, "", "rw"),
-    ("RAILWAY_WORKSPACE_ID", "railway_workspace", "Railway workspace id (only for a workspace token; else Enter)", False, False,
-     v_any, "", "rw"),
+    ("RAILWAY_WORKSPACE_ID", "railway_workspace", "Railway workspace id (not asked: the deploy finds the workspace by itself)", False,
+     False, v_any, "", "rwx"),
     ("RAILWAY_REGION", "railway_region", "Railway region (optional, e.g. europe-west4-drams3a; Enter = Railway's default)", False,
      False, v_any, "", "rw"),
     ("ALLOW", "allow", "Exit allowed to: 'all' (SOCKS5 + MTProto) or 'telegram' (MTProto only)", False, True,
@@ -179,10 +180,12 @@ def cmd_setup(args) -> int:
         say(bold("cfproxy setup") + dim(f"   (saved in {path}; Enter keeps what is already there)"))
     target = getattr(args, "target", None) or env("CFP_TARGET") or "worker"
     for name, attr, question, secret, required, validate, default, group in SETUP_FIELDS:
-        if (group == "cf" and target == "railway") or (group == "rw" and target != "railway"):
+        if (group == "cf" and target == "railway") or (group in ("rw", "rwx") and target != "railway"):
             continue
         current = env(name)
         value = getattr(args, attr, None)
+        if value is None and group == "rwx":
+            continue  # never asked: what is saved stays as it is
         if value is None:
             if not interactive:
                 value = current or default
