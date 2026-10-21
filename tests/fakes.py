@@ -549,6 +549,9 @@ class FakeRailway:
         self.workspace_token = False          # a workspace token has no `me`
         self.require_workspace = False        # projectCreate refuses to guess the workspace
         self.workspace_id = "ws-test"
+        self.workspace_name = "Test Workspace"
+        self.extra_workspaces = []            # more workspaces of the account: [{"id", "name"}]
+        self.me_shape = "workspaces"          # how `me` lists them: "workspaces" | "teams" (the older shape) | "" (not at all)
         self.deploy_status = None             # force the status of new deployments, e.g. "FAILED"
         self.flaky = 0                        # answer the next N requests with HTTP 503
         self.projects = {}                    # id -> {"id", "name", "environments", "services": {id: service}}
@@ -642,18 +645,28 @@ class FakeRailway:
         return "INITIALIZING" if dep["polls"] == 1 else "DEPLOYING"
 
     # ------------------------------------------------------------ the operations (root fields of the GraphQL documents)
+    def all_workspaces(self):
+        return [{"id": self.workspace_id, "name": self.workspace_name}] + list(self.extra_workspaces)
+
     def op_me(self, v):
         if self.workspace_token:
             raise GqlError("Not Authorized")
-        return {"name": "Test User", "email": "test@example.com"}
+        me = {"name": "Test User", "email": "test@example.com"}
+        if self.me_shape == "workspaces":
+            me["workspaces"] = self.all_workspaces()
+        elif self.me_shape == "teams":
+            me["teams"] = {"edges": [{"node": w} for w in self.all_workspaces()]}
+        return me
 
-    def op_projects(self, v):
-        return {"edges": [{"node": self.project_json(p)} for p in self.projects.values()]}
+    def op_projects(self, v, workspace=None):
+        # a project made without a workspace id lives in the main one, like Railway's own default
+        mine = [p for p in self.projects.values() if workspace is None or (p.get("workspaceId") or self.workspace_id) == workspace]
+        return {"edges": [{"node": self.project_json(p)} for p in mine]}
 
     def op_workspace(self, v):
-        if v.get("w") != self.workspace_id:
+        if v.get("w") not in {w["id"] for w in self.all_workspaces()}:
             raise GqlError("Workspace not found")
-        return {"projects": self.op_projects(v)}
+        return {"projects": self.op_projects(v, workspace=v["w"])}
 
     def op_project(self, v):
         p = self.projects.get(v["id"])
@@ -663,7 +676,7 @@ class FakeRailway:
         inp = v["input"]
         if self.require_workspace and not inp.get("workspaceId"):
             raise GqlError("workspaceId is required")
-        if inp.get("workspaceId") not in (None, self.workspace_id):
+        if inp.get("workspaceId") not in (None, *[w["id"] for w in self.all_workspaces()]):
             raise GqlError("Workspace not found")
         pid = self.nid("proj")
         self.projects[pid] = {"id": pid, "name": inp["name"], "workspaceId": inp.get("workspaceId"), "services": {},

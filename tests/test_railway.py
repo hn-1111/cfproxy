@@ -167,14 +167,85 @@ class OnTheRunner(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("CUSTOM_DOMAIN is not used with Railway", result["log"])
 
-    def test_a_railway_that_wants_a_workspace_says_how_to_give_it(self):
+    def test_nothing_has_to_be_given_the_workspace_is_found_by_itself(self):
+        proc, result = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], self.rw.workspace_id)
+        self.assertIn(self.rw.workspace_name, result["log"])  # and it says which one it took
+        self.assertNotIn("[WARN] Railway does not know", result["log"])
+
+    def test_a_railway_that_wants_a_workspace_gets_the_one_that_is_found(self):
         self.rw.require_workspace = True
+        proc, _ = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], self.rw.workspace_id)
+
+    def test_a_railway_that_wants_a_workspace_and_lists_none_says_how_to_give_it(self):
+        self.rw.require_workspace = True
+        self.rw.me_shape = ""  # `me` does not say which workspaces there are
         proc, result = self.run_script()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("workspaceId is required", result["log"])
         self.assertIn("RAILWAY_WORKSPACE_ID", result["log"])
+        self.assertIn("--railway-workspace", result["log"])
         proc, _ = self.run_script(RAILWAY_WORKSPACE_ID=self.rw.workspace_id)  # and with it, it works
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_the_older_teams_shape_of_me_is_understood_too(self):
+        self.rw.me_shape = "teams"
+        proc, _ = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], self.rw.workspace_id)
+
+    # ------------------------------------------------------------ a workspace id that is wrong must not stop the deploy
+    def test_a_workspace_id_that_railway_does_not_know_is_ignored(self):
+        # what a first-time user ran into: the workspace question was answered with something that is no workspace id
+        proc, result = self.run_script(RAILWAY_WORKSPACE_ID="not-a-workspace-id")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("[WARN] Railway does not know the workspace 'not-a-workspace-id'", result["log"])
+        self.assertEqual(self.only_project()["workspaceId"], self.rw.workspace_id)  # the right one was found instead
+        self.assertTrue(result["ok"])
+
+    def test_a_workspace_token_with_a_wrong_workspace_id_still_deploys(self):
+        self.rw.workspace_token = True  # cannot list workspaces: the given id is asked about, and found wrong
+        proc, result = self.run_script(RAILWAY_WORKSPACE_ID="nope")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Railway does not know the workspace 'nope'", result["log"])
+        self.assertEqual(len(self.rw.projects), 1)
+
+    def test_the_workspace_may_be_given_by_its_name(self):
+        self.rw.extra_workspaces = [{"id": "ws-second", "name": "Second Team"}]
+        proc, _ = self.run_script(RAILWAY_WORKSPACE_ID="second team")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], "ws-second")
+
+    def test_with_several_workspaces_the_one_that_holds_the_project_is_used_again(self):
+        self.rw.extra_workspaces = [{"id": "ws-second", "name": "Second Team"}]
+        proc, _ = self.run_script(RAILWAY_WORKSPACE_ID="ws-second")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], "ws-second")
+        proc, result = self.run_script()  # nothing given now: the project is found where it is, not made a second time
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rw.count("projectCreate"), 1)
+        self.assertEqual(self.rw.count("serviceCreate"), 1)
+        self.assertIn("Second Team", result["log"])
+
+    def test_with_several_workspaces_and_no_project_yet_it_says_which_one_it_took(self):
+        self.rw.extra_workspaces = [{"id": "ws-second", "name": "Second Team"}]
+        proc, result = self.run_script()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.only_project()["workspaceId"], self.rw.workspace_id)  # the first one the account lists
+        self.assertIn("ws-second", result["log"])  # the others are named, so the choice can be changed
+        self.assertIn("RAILWAY_WORKSPACE_ID", result["log"])
+
+    def test_check_and_destroy_do_not_trip_over_a_wrong_workspace_id_either(self):
+        self.assertEqual(self.run_script()[0].returncode, 0)
+        proc, result = self.run_script("check", RAILWAY_WORKSPACE_ID="wrong")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("exists", result["log"])
+        proc, _ = self.run_script("destroy", RAILWAY_WORKSPACE_ID="wrong")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.rw.projects, {})
 
     def test_a_hiccup_of_the_api_is_retried(self):
         self.rw.flaky = 2

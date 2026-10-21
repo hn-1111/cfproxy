@@ -140,6 +140,31 @@ class RailwayChain(unittest.TestCase):
         env = self.dotenv()
         self.assertEqual((env["RAILWAY_REGION"], env["RAILWAY_WORKSPACE_ID"]), ("europe-west4-drams3a", "ws-1"))
 
+    def test_an_interactive_setup_never_asks_for_the_workspace(self):
+        asked = []
+        answers = {"GitHub token": self.world.token, "GitHub repository": "alice/cfproxy", "Deploy as": "railway",
+                   "Railway API token": RW_TOKEN}
+
+        def fake_ask(label, default="", secret=False, required=True):
+            asked.append(label)
+            return next((v for k, v in answers.items() if label.startswith(k)), default)
+
+        terminal = mock.Mock()
+        terminal.isatty.return_value = True
+        with mock.patch.object(cfproxy, "ask", fake_ask), mock.patch.object(cfproxy.sys, "stdin", terminal):
+            code, _, err = self.cli("setup")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(any(q.startswith("Railway API token") for q in asked), asked)
+        self.assertFalse(any("workspace id" in q.lower() for q in asked), asked)  # found by the deploy itself
+        self.assertNotIn("RAILWAY_WORKSPACE_ID", {k for k, v in self.dotenv().items() if v})
+
+    def test_a_workspace_id_saved_earlier_is_cleared_with_an_empty_flag(self):
+        self.setup_settings(**{"--railway-workspace": "wrong-id"})
+        self.assertEqual(self.dotenv()["RAILWAY_WORKSPACE_ID"], "wrong-id")
+        code, _, err = self.cli("setup", "--non-interactive", "--railway-workspace", "")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.dotenv().get("RAILWAY_WORKSPACE_ID"))
+
     def test_init_sends_the_railway_settings_and_every_file_the_runner_needs(self):
         self.setup_settings(**{"--railway-region": "europe-west4-drams3a"})
         code, _, err = self.cli("init")
